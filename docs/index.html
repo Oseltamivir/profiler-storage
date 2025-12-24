@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Perfetto Trace Relay (Redirect)</title>
+  <title>Perfetto Trace Relay</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 2rem; line-height: 1.4; }
     code { background: #f3f4f6; padding: 0.15rem 0.35rem; border-radius: 0.25rem; }
@@ -17,37 +17,35 @@
   </style>
 </head>
 <body>
-  <h1>Perfetto Trace Relay (Redirect)</h1>
+  <h1>Perfetto Trace Relay</h1>
   <p class="muted">
-    This page redirects the current tab to <code>https://ui.perfetto.dev</code> using Perfetto’s deep link:
-    <code>https://ui.perfetto.dev/#!/?url=&lt;TRACE_URL&gt;</code>.
-    Use: <code>?src=&lt;TRACE_URL&gt;</code>
+    This page opens <code>https://ui.perfetto.dev</code> and injects a trace via <code>postMessage()</code>.
+    Use query params: <code>?src=&lt;TRACE_URL&gt;&amp;title=&lt;OPTIONAL&gt;</code>
   </p>
 
   <div class="box">
     <p><strong>Status:</strong> <span id="status">Initializing...</span></p>
     <p class="muted" id="details"></p>
     <p>
-      <button id="btnGo" style="display:none;">Open in Perfetto</button>
       <button id="btnRetry" style="display:none;">Retry</button>
+      <button id="btnClose" style="display:none;">Close this tab</button>
     </p>
   </div>
 
   <div class="box">
     <p><strong>Example</strong></p>
     <p class="muted">
-      <code>?src=https%3A%2F%2Fcommondatastorage.googleapis.com%2F...%2Ftrace.pftrace</code>
+      <code>?src=https%3A%2F%2Fraw.githubusercontent.com%2F...%2Ftrace.json.gz&amp;title=my-trace</code>
     </p>
   </div>
 
 <script>
-(() => {
+(async () => {
   const PERFETTO_UI_URL = 'https://ui.perfetto.dev';
-
   const statusEl = document.getElementById('status');
   const detailsEl = document.getElementById('details');
-  const btnGo = document.getElementById('btnGo');
   const btnRetry = document.getElementById('btnRetry');
+  const btnClose = document.getElementById('btnClose');
 
   const setStatus = (msg, isError = false, details = '') => {
     statusEl.textContent = msg;
@@ -57,57 +55,139 @@
     if (isError) console.error(msg, details || '');
   };
 
-  const buildPerfettoUrl = (srcUrl) => {
-    // Perfetto expects the deep-link args in the hash route: /#!/?url=...
-    return `${PERFETTO_UI_URL}/#!/?url=${encodeURIComponent(srcUrl)}`;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Ping/Pong handshake to avoid "message dropped" race condition
+  const establishHandshake = (uiWin, timeoutMs = 15000) => {
+    return new Promise((resolve, reject) => {
+      let intervalId = null;
+      let timeoutId = null;
+
+      const cleanup = () => {
+        if (intervalId) clearInterval(intervalId);
+        if (timeoutId) clearTimeout(timeoutId);
+        window.removeEventListener('message', onMsg);
+      };
+
+      const onMsg = (event) => {
+        if (event.source === uiWin && event.data === 'PONG') {
+          cleanup();
+          resolve();
+        }
+      };
+
+      window.addEventListener('message', onMsg);
+
+      intervalId = setInterval(() => {
+        try {
+          uiWin.postMessage('PING', PERFETTO_UI_URL);
+        } catch (e) {
+          cleanup();
+          reject(new Error('Perfetto UI window was closed before handshake completed.'));
+        }
+      }, 100);
+
+      timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error('Handshake timed out (no PONG). Perfetto UI might not have loaded.'));
+      }, timeoutMs);
+    });
   };
 
-  const run = () => {
+  const fetchTraceAsArrayBuffer = async (srcUrl) => {
+    // Important: no credentials. If src requires auth, this will fail.
+    const resp = await fetch(srcUrl, {
+      mode: 'cors',
+      credentials: 'omit',
+      cache: 'no-store',
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch trace (${resp.status} ${resp.statusText}) from: ${srcUrl}`);
+    }
+
+    return await resp.arrayBuffer();
+  };
+
+  const inferFileName = (srcUrl, title) => {
+    const last = (srcUrl.split('/').pop() || 'trace').split('?')[0];
+    if (title) return title;
+    return last || 'trace';
+  };
+
+  const openAndPostTrace = async (srcUrl, title) => {
+    setStatus('Opening Perfetto UI...', false);
+
+    const uiWin = window.open(PERFETTO_UI_URL);
+    if (!uiWin) {
+      throw new Error('Popup blocked. Allow popups for this site and retry.');
+    }
+
+    setStatus('Waiting for Perfetto UI handshake (PING/PONG)...', false);
+    await establishHandshake(uiWin);
+
+    setStatus('Fetching trace bytes...', false, srcUrl);
+    const buffer = await fetchTraceAsArrayBuffer(srcUrl);
+
+    const inferred = inferFileName(srcUrl, title);
+    const fileName = inferred.endsWith('.gz') || inferred.endsWith('.zip') || inferred.endsWith('.trace')
+      ? inferred
+      : `${inferred}.trace`;
+
+    // Post trace payload to Perfetto UI
+    setStatus('Sending trace to Perfetto UI...', false);
+    uiWin.postMessage({
+      perfetto: {
+        buffer,
+        title: title || inferred,
+        fileName,
+        // Optional: Perfetto supports keeping API open for debugging; harmless otherwise.
+        keepApiOpen: true,
+      }
+    }, PERFETTO_UI_URL, [buffer]); // transfer ownership of buffer for speed
+
+    setStatus('Done. Trace sent to Perfetto UI.', false, 'You can close this relay tab.');
+    btnClose.style.display = '';
+    btnClose.onclick = () => window.close();
+  };
+
+  const run = async () => {
     const params = new URLSearchParams(window.location.search);
     const src = params.get('src');
+    const title = params.get('title') || '';
 
     if (!src) {
       setStatus(
         'Missing required query parameter: src',
         true,
-        'Usage: ?src=<TRACE_URL>'
+        'Usage: ?src=<TRACE_URL>&title=<optional>'
       );
-      btnRetry.style.display = '';
       return;
     }
 
+    // Basic sanity check: avoid obviously non-http(s)
     if (!/^https?:\/\//i.test(src)) {
       setStatus('src must be an http(s) URL', true, src);
-      btnRetry.style.display = '';
       return;
     }
 
-    const target = buildPerfettoUrl(src);
-    setStatus('Redirecting to Perfetto UI...', false, target);
-
-    // Some browsers block immediate navigation depending on how the page was opened.
-    // Provide a click fallback (user gesture) just in case.
-    btnGo.style.display = '';
-    btnGo.onclick = () => {
-      // replace() avoids keeping this relay page in back/forward history
-      window.location.replace(target);
-    };
-
-    // Try auto-redirect immediately.
-    try {
-      window.location.replace(target);
-    } catch (e) {
-      setStatus('Auto-redirect failed. Click "Open in Perfetto".', true, String(e));
-    }
+    await openAndPostTrace(src, title);
   };
 
   btnRetry.onclick = () => {
     btnRetry.style.display = 'none';
-    btnGo.style.display = 'none';
-    run();
+    run().catch(err => {
+      setStatus(err.message, true);
+      btnRetry.style.display = '';
+    });
   };
 
-  run();
+  try {
+    await run();
+  } catch (err) {
+    setStatus(err.message || String(err), true);
+    btnRetry.style.display = '';
+  }
 })();
 </script>
 </body>
